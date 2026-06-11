@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import torch
@@ -21,6 +22,21 @@ from train2 import (
     TARGET_DATASET_ACC,
     TOKENIZER_PATH,
 )
+
+
+def resolve_device(requested: str | None = None) -> torch.device:
+    if requested is None:
+        return choose_device()
+    if requested == "cuda" and not torch.cuda.is_available():
+        print("warning: CUDA is not available; falling back to CPU.", file=sys.stderr)
+        return torch.device("cpu")
+    if (
+        requested == "mps"
+        and (not getattr(torch.backends, "mps", None) or not torch.backends.mps.is_available())
+    ):
+        print("warning: MPS is not available; falling back to CPU.", file=sys.stderr)
+        return torch.device("cpu")
+    return torch.device(requested)
 
 
 def load_tinygpt(model_path: Path, tokenizer_path: Path, device: torch.device) -> tuple[BPETokenizer, TinyGPT, dict]:
@@ -109,7 +125,7 @@ def continue_text(
 
 
 def run_continuation(args: argparse.Namespace) -> None:
-    device = torch.device(args.device) if args.device else choose_device()
+    device = resolve_device(args.device)
     if args.seed is not None:
         torch.manual_seed(args.seed)
         if device.type == "cuda":
@@ -151,7 +167,7 @@ def trim_response(text: str) -> str:
 
 
 def run_chat(args: argparse.Namespace) -> None:
-    device = torch.device(args.device) if args.device else choose_device()
+    device = resolve_device(args.device)
     if args.seed is not None:
         torch.manual_seed(args.seed)
         if device.type == "cuda":
