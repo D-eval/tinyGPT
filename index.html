@@ -127,8 +127,9 @@
       return value && value.trim() ? value.trim() : fallback;
     }
 
-    const MODEL_URL = assetUrl("model", "tinygpt.onnx");
-    const TOKENIZER_URL = assetUrl("tokenizer", "params/tokenizer2.json");
+    const MODEL_URL = assetUrl("model", "https://huggingface.co/BoiWanKenobi/myNovelGPT/resolve/main/tinygpt.onnx");
+    const METADATA_URL = assetUrl("metadata", "https://huggingface.co/BoiWanKenobi/myNovelGPT/resolve/main/tinygpt.onnx.json");
+    const TOKENIZER_URL = assetUrl("tokenizer", "https://huggingface.co/BoiWanKenobi/myNovelGPT/resolve/main/params/tokenizer2.json");
 
     const promptEl = document.getElementById("prompt");
     const buttonEl = document.getElementById("continueButton");
@@ -139,6 +140,7 @@
 
     let sessionPromise = null;
     let tokenizerPromise = null;
+    let metadataPromise = null;
 
     function assertHttpPage() {
       if (location.protocol === "file:") {
@@ -271,6 +273,13 @@
     async function loadEverything() {
       assertHttpPage();
       buttonEl.disabled = true;
+      if (!metadataPromise) {
+        metadataPromise = fetch(METADATA_URL)
+          .then((response) => {
+            if (!response.ok) throw new Error(`加载 metadata 失败: ${response.status}`);
+            return response.json();
+          });
+      }
       if (!tokenizerPromise) {
         tokenizerPromise = fetch(TOKENIZER_URL)
           .then((response) => {
@@ -282,10 +291,10 @@
       if (!sessionPromise) {
         sessionPromise = ort.InferenceSession.create(MODEL_URL);
       }
-      const [tokenizer, session] = await Promise.all([tokenizerPromise, sessionPromise]);
+      const [metadata, tokenizer, session] = await Promise.all([metadataPromise, tokenizerPromise, sessionPromise]);
       buttonEl.disabled = false;
       statusEl.textContent = "模型已加载。";
-      return { tokenizer, session };
+      return { metadata, tokenizer, session };
     }
 
     function softmaxSample(logits, temperature, topK) {
@@ -309,14 +318,14 @@
     }
 
     async function generate() {
-      const { tokenizer, session } = await loadEverything();
+      const { metadata, tokenizer, session } = await loadEverything();
       buttonEl.disabled = true;
       const maxNewTokens = Math.max(1, Math.min(300, Number(maxTokensEl.value) || 80));
       const temperature = Number(temperatureEl.value) || 0.9;
       const topK = Math.max(0, Math.floor(Number(topKEl.value) || 0));
       let ids = tokenizer.encode(promptEl.value, true);
       const originalLength = ids.length;
-      const blockSize = 10000;
+      const blockSize = Number(metadata.block_size) || 10000;
 
       try {
         for (let step = 0; step < maxNewTokens; step++) {

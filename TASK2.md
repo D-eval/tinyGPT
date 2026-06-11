@@ -227,6 +227,13 @@ const session =
 const outputs =
     await session.run(inputs);
 
+上传到了 hugging face
+
+然后接下来在 index.html 里直接加载 
+https://huggingface.co/BoiWanKenobi/myNovelGPT/resolve/main/tinygpt.onnx
+https://huggingface.co/BoiWanKenobi/myNovelGPT/resolve/main/tinygpt.onnx.json
+
+
 nohup python3 -u train2.py --max-epochs 5000 > train2.log 2>&1 &
 
 nohup python3 -u preprocess.py --max-epochs 5000 > preprocess.log 2>&1 &
