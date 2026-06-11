@@ -28,7 +28,9 @@ def patch_attention_for_onnx(model: torch.nn.Module) -> None:
     def forward(self: CausalSelfAttention, x: torch.Tensor) -> torch.Tensor:
         batch, steps, channels = x.shape
         qkv = self.qkv(x)
-        q, k, v = qkv.split(channels, dim=2)
+        q = qkv[:, :, :channels]
+        k = qkv[:, :, channels : 2 * channels]
+        v = qkv[:, :, 2 * channels :]
         q = q.view(batch, steps, self.n_head, self.head_dim).transpose(1, 2)
         k = k.view(batch, steps, self.n_head, self.head_dim).transpose(1, 2)
         v = v.view(batch, steps, self.n_head, self.head_dim).transpose(1, 2)
