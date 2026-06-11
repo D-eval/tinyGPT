@@ -135,6 +135,12 @@
     let sessionPromise = null;
     let tokenizerPromise = null;
 
+    function assertHttpPage() {
+      if (location.protocol === "file:") {
+        throw new Error("请用本地 HTTP 服务打开本页，例如 python3 -m http.server 8000 后访问 http://127.0.0.1:8000/write.html");
+      }
+    }
+
     function bytesToUnicodeMap() {
       const bs = [];
       for (let i = 33; i <= 126; i++) bs.push(i);
@@ -258,6 +264,7 @@
     }
 
     async function loadEverything() {
+      assertHttpPage();
       buttonEl.disabled = true;
       if (!tokenizerPromise) {
         tokenizerPromise = fetch(TOKENIZER_URL)
