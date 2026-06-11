@@ -3,6 +3,7 @@ dataset2/preprocess10000/
 
 *.pt
 *.json
+!params/tokenizer2.json
 *.jsonl
 *.onnx
 *.onnx.data

@@ -122,8 +122,13 @@
   </main>
 
   <script>
-    const MODEL_URL = "tinygpt.onnx";
-    const TOKENIZER_URL = "params/tokenizer2.json";
+    function assetUrl(name, fallback) {
+      const value = new URLSearchParams(location.search).get(name);
+      return value && value.trim() ? value.trim() : fallback;
+    }
+
+    const MODEL_URL = assetUrl("model", "tinygpt.onnx");
+    const TOKENIZER_URL = assetUrl("tokenizer", "params/tokenizer2.json");
 
     const promptEl = document.getElementById("prompt");
     const buttonEl = document.getElementById("continueButton");
@@ -137,7 +142,7 @@
 
     function assertHttpPage() {
       if (location.protocol === "file:") {
-        throw new Error("请用本地 HTTP 服务打开本页，例如 python3 -m http.server 8000 后访问 http://127.0.0.1:8000/write.html");
+        throw new Error("请通过 HTTP/HTTPS 打开本页，例如 GitHub Pages 地址；浏览器不允许 file:// 页面加载 ONNX 和 tokenizer。");
       }
     }
 
