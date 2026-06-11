@@ -4,6 +4,8 @@ dataset2/preprocess10000/
 *.pt
 *.json
 *.jsonl
+*.onnx
+*.onnx.data
 
 __pycache__/
 *.py[cod]

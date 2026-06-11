@@ -199,6 +199,33 @@ tokenizer保存为 ./params/tokenizer2.json
 按照 1.txt, 2.txt, ...
 往后写一个，作为你的报告
 
+# stage 4
+
+写文件
+
+export_onnx.py
+write.html
+用户写一段话，按下续写按钮自动续写
+
+把
+/home/vipuser/wby/proj_params/tinyGPT/test2.py
+模型导出为 onnx
+
+然后网页：
+
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+
+加载：
+
+const session =
+    await ort.InferenceSession.create(
+        "tinygpt.onnx"
+    );
+
+推理：
+
+const outputs =
+    await session.run(inputs);
 
 nohup python3 -u train2.py --max-epochs 5000 > train2.log 2>&1 &
 

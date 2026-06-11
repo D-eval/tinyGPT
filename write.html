@@ -1,0 +1,350 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TinyGPT 续写</title>
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #f6f7f9;
+      color: #20242a;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+    }
+
+    main {
+      width: min(980px, calc(100vw - 32px));
+      margin: 0 auto;
+      padding: 32px 0;
+    }
+
+    h1 {
+      margin: 0 0 20px;
+      font-size: 28px;
+      font-weight: 720;
+      letter-spacing: 0;
+    }
+
+    .workspace {
+      display: grid;
+      gap: 14px;
+    }
+
+    textarea {
+      width: 100%;
+      min-height: 52vh;
+      box-sizing: border-box;
+      resize: vertical;
+      border: 1px solid #cdd3dc;
+      border-radius: 8px;
+      padding: 16px;
+      font: 16px/1.65 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      color: #181b20;
+      background: #fff;
+      outline: none;
+    }
+
+    textarea:focus {
+      border-color: #2f6feb;
+      box-shadow: 0 0 0 3px rgba(47, 111, 235, 0.14);
+    }
+
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 12px;
+    }
+
+    button {
+      height: 40px;
+      border: 0;
+      border-radius: 8px;
+      padding: 0 18px;
+      background: #1f6feb;
+      color: white;
+      font-size: 15px;
+      font-weight: 650;
+      cursor: pointer;
+    }
+
+    button:disabled {
+      background: #9aa7b5;
+      cursor: wait;
+    }
+
+    label {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      color: #3e4650;
+      font-size: 14px;
+      white-space: nowrap;
+    }
+
+    input[type="number"] {
+      width: 76px;
+      height: 34px;
+      box-sizing: border-box;
+      border: 1px solid #cdd3dc;
+      border-radius: 6px;
+      padding: 0 8px;
+      font-size: 14px;
+      background: white;
+    }
+
+    .status {
+      min-height: 22px;
+      color: #5b6572;
+      font-size: 14px;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>TinyGPT 续写</h1>
+    <section class="workspace">
+      <textarea id="prompt" spellcheck="false" placeholder="写一段话，然后点击续写。"></textarea>
+      <div class="controls">
+        <button id="continueButton" type="button">续写</button>
+        <label>生成 token <input id="maxTokens" type="number" min="1" max="300" value="80"></label>
+        <label>temperature <input id="temperature" type="number" min="0.1" max="2" step="0.1" value="0.9"></label>
+        <label>top-k <input id="topK" type="number" min="0" max="200" step="1" value="50"></label>
+      </div>
+      <div id="status" class="status">等待加载模型...</div>
+    </section>
+  </main>
+
+  <script>
+    const MODEL_URL = "tinygpt.onnx";
+    const TOKENIZER_URL = "params/tokenizer2.json";
+
+    const promptEl = document.getElementById("prompt");
+    const buttonEl = document.getElementById("continueButton");
+    const statusEl = document.getElementById("status");
+    const maxTokensEl = document.getElementById("maxTokens");
+    const temperatureEl = document.getElementById("temperature");
+    const topKEl = document.getElementById("topK");
+
+    let sessionPromise = null;
+    let tokenizerPromise = null;
+
+    function bytesToUnicodeMap() {
+      const bs = [];
+      for (let i = 33; i <= 126; i++) bs.push(i);
+      for (let i = 161; i <= 172; i++) bs.push(i);
+      for (let i = 174; i <= 255; i++) bs.push(i);
+      const cs = bs.slice();
+      let n = 0;
+      for (let b = 0; b <= 255; b++) {
+        if (!bs.includes(b)) {
+          bs.push(b);
+          cs.push(256 + n);
+          n += 1;
+        }
+      }
+      const byteToChar = new Map();
+      const charToByte = new Map();
+      for (let i = 0; i < bs.length; i++) {
+        const ch = String.fromCodePoint(cs[i]);
+        byteToChar.set(bs[i], ch);
+        charToByte.set(ch, bs[i]);
+      }
+      return { byteToChar, charToByte };
+    }
+
+    function getPairs(word) {
+      const pairs = [];
+      for (let i = 0; i < word.length - 1; i++) {
+        pairs.push([word[i], word[i + 1]]);
+      }
+      return pairs;
+    }
+
+    class ByteLevelBPE {
+      constructor(payload) {
+        this.vocab = payload.model.vocab;
+        this.idToToken = [];
+        for (const [token, id] of Object.entries(this.vocab)) this.idToToken[id] = token;
+        this.unkId = this.vocab["<unk>"];
+        this.bosId = this.vocab["<bos>"];
+        this.eosId = this.vocab["<eos>"];
+        this.specialIds = new Set([
+          this.vocab["<pad>"],
+          this.vocab["<unk>"],
+          this.vocab["<bos>"],
+          this.vocab["<eos>"],
+        ]);
+        this.ranks = new Map();
+        payload.model.merges.forEach((merge, index) => {
+          this.ranks.set(`${merge[0]}\u0001${merge[1]}`, index);
+        });
+        const maps = bytesToUnicodeMap();
+        this.byteToChar = maps.byteToChar;
+        this.charToByte = maps.charToByte;
+        this.encoder = new TextEncoder();
+        this.decoder = new TextDecoder("utf-8", { fatal: false });
+        this.cache = new Map();
+        this.pattern = /'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+/gu;
+      }
+
+      encode(text, addBos = true) {
+        const ids = addBos ? [this.bosId] : [];
+        const chunks = text.match(this.pattern) || [];
+        for (const chunk of chunks) {
+          let token = "";
+          for (const byte of this.encoder.encode(chunk)) token += this.byteToChar.get(byte);
+          for (const piece of this.bpe(token)) ids.push(this.vocab[piece] ?? this.unkId);
+        }
+        return ids;
+      }
+
+      bpe(token) {
+        if (this.cache.has(token)) return this.cache.get(token);
+        let word = Array.from(token);
+        if (word.length <= 1) {
+          this.cache.set(token, word);
+          return word;
+        }
+
+        while (true) {
+          let bestPair = null;
+          let bestRank = Infinity;
+          for (const pair of getPairs(word)) {
+            const rank = this.ranks.get(`${pair[0]}\u0001${pair[1]}`);
+            if (rank !== undefined && rank < bestRank) {
+              bestPair = pair;
+              bestRank = rank;
+            }
+          }
+          if (bestPair === null) break;
+
+          const nextWord = [];
+          for (let i = 0; i < word.length; i++) {
+            if (i < word.length - 1 && word[i] === bestPair[0] && word[i + 1] === bestPair[1]) {
+              nextWord.push(word[i] + word[i + 1]);
+              i += 1;
+            } else {
+              nextWord.push(word[i]);
+            }
+          }
+          word = nextWord;
+          if (word.length === 1) break;
+        }
+
+        this.cache.set(token, word);
+        return word;
+      }
+
+      decode(ids) {
+        const bytes = [];
+        for (const id of ids) {
+          if (this.specialIds.has(id)) continue;
+          const token = this.idToToken[id];
+          if (token === undefined) continue;
+          for (const ch of Array.from(token)) {
+            const byte = this.charToByte.get(ch);
+            if (byte !== undefined) bytes.push(byte);
+          }
+        }
+        return this.decoder.decode(new Uint8Array(bytes));
+      }
+    }
+
+    async function loadEverything() {
+      buttonEl.disabled = true;
+      if (!tokenizerPromise) {
+        tokenizerPromise = fetch(TOKENIZER_URL)
+          .then((response) => {
+            if (!response.ok) throw new Error(`加载 tokenizer 失败: ${response.status}`);
+            return response.json();
+          })
+          .then((payload) => new ByteLevelBPE(payload));
+      }
+      if (!sessionPromise) {
+        sessionPromise = ort.InferenceSession.create(MODEL_URL);
+      }
+      const [tokenizer, session] = await Promise.all([tokenizerPromise, sessionPromise]);
+      buttonEl.disabled = false;
+      statusEl.textContent = "模型已加载。";
+      return { tokenizer, session };
+    }
+
+    function softmaxSample(logits, temperature, topK) {
+      const scaled = [];
+      const safeTemperature = Math.max(temperature, 0.0001);
+      for (let i = 0; i < logits.length; i++) scaled.push([i, logits[i] / safeTemperature]);
+      scaled.sort((a, b) => b[1] - a[1]);
+      const candidates = topK > 0 ? scaled.slice(0, Math.min(topK, scaled.length)) : scaled;
+      const maxLogit = candidates[0][1];
+      let total = 0;
+      for (const item of candidates) {
+        item[2] = Math.exp(item[1] - maxLogit);
+        total += item[2];
+      }
+      let r = Math.random() * total;
+      for (const item of candidates) {
+        r -= item[2];
+        if (r <= 0) return item[0];
+      }
+      return candidates[candidates.length - 1][0];
+    }
+
+    async function generate() {
+      const { tokenizer, session } = await loadEverything();
+      buttonEl.disabled = true;
+      const maxNewTokens = Math.max(1, Math.min(300, Number(maxTokensEl.value) || 80));
+      const temperature = Number(temperatureEl.value) || 0.9;
+      const topK = Math.max(0, Math.floor(Number(topKEl.value) || 0));
+      let ids = tokenizer.encode(promptEl.value, true);
+      const originalLength = ids.length;
+      const blockSize = 10000;
+
+      try {
+        for (let step = 0; step < maxNewTokens; step++) {
+          const context = ids.slice(Math.max(0, ids.length - blockSize));
+          const input = new ort.Tensor("int64", BigInt64Array.from(context.map(BigInt)), [1, context.length]);
+          const outputs = await session.run({ input_ids: input });
+          const logitsTensor = outputs.logits;
+          const vocabSize = logitsTensor.dims[2];
+          const offset = (logitsTensor.dims[1] - 1) * vocabSize;
+          const nextLogits = logitsTensor.data.slice(offset, offset + vocabSize);
+          const nextId = softmaxSample(nextLogits, temperature, topK);
+          ids.push(nextId);
+          promptEl.value += tokenizer.decode([nextId]);
+          statusEl.textContent = `已生成 ${step + 1} / ${maxNewTokens} token`;
+          await new Promise((resolve) => requestAnimationFrame(resolve));
+          if (nextId === tokenizer.eosId) break;
+        }
+        const generated = tokenizer.decode(ids.slice(originalLength));
+        if (generated && !promptEl.value.endsWith(generated)) {
+          promptEl.value = tokenizer.decode(ids);
+        }
+        statusEl.textContent = "续写完成。";
+      } finally {
+        buttonEl.disabled = false;
+      }
+    }
+
+    buttonEl.addEventListener("click", () => {
+      generate().catch((error) => {
+        console.error(error);
+        statusEl.textContent = error.message || String(error);
+        buttonEl.disabled = false;
+      });
+    });
+
+    loadEverything().catch((error) => {
+      console.error(error);
+      statusEl.textContent = error.message || String(error);
+      buttonEl.disabled = false;
+    });
+  </script>
+</body>
+</html>
