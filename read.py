@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import json
-from collections import Counter
 from pathlib import Path
+
+from tokenizers import Tokenizer
+from tokenizers.decoders import ByteLevel as ByteLevelDecoder
+from tokenizers.models import BPE
+from tokenizers.pre_tokenizers import ByteLevel
+from tokenizers.trainers import BpeTrainer
 
 
 SPECIAL_TOKENS = ["<pad>", "<unk>", "<bos>", "<eos>"]
@@ -26,70 +31,50 @@ def read_texts(dataset_dir: str | Path = "dataset") -> list[tuple[Path, str]]:
     return texts
 
 
+def read_ids(
+    tokenizer: "BPETokenizer",
+    dataset_dir: str | Path = "dataset",
+    add_bos: bool = True,
+    add_eos: bool = True,
+) -> list[tuple[Path, list[int]]]:
+    samples: list[tuple[Path, list[int]]] = []
+    for path, text in read_texts(dataset_dir):
+        ids = tokenizer.encode(text, add_bos=add_bos, add_eos=add_eos)
+        if ids:
+            samples.append((path, ids))
+    return samples
+
+
 class BPETokenizer:
-    def __init__(
-        self,
-        token_to_id: dict[str, int],
-        merges: list[tuple[str, str]],
-        target_vocab_size: int = 16000,
-    ) -> None:
-        self.token_to_id = token_to_id
-        self.id_to_token = {idx: token for token, idx in token_to_id.items()}
-        self.merges = merges
+    def __init__(self, tokenizer: Tokenizer, target_vocab_size: int = 16000) -> None:
+        self.tokenizer = tokenizer
         self.target_vocab_size = target_vocab_size
-        self.pad_id = token_to_id["<pad>"]
-        self.unk_id = token_to_id["<unk>"]
-        self.bos_id = token_to_id["<bos>"]
-        self.eos_id = token_to_id["<eos>"]
-        self._merge_ranks = {pair: rank for rank, pair in enumerate(merges)}
+        vocab = tokenizer.get_vocab()
+        self.pad_id = vocab["<pad>"]
+        self.unk_id = vocab["<unk>"]
+        self.bos_id = vocab["<bos>"]
+        self.eos_id = vocab["<eos>"]
 
     @property
     def vocab_size(self) -> int:
-        return len(self.token_to_id)
+        return self.tokenizer.get_vocab_size()
 
     @classmethod
-    def train(
-        cls,
-        texts: list[str],
-        vocab_size: int = 16000,
-        min_pair_freq: int = 2,
-    ) -> "BPETokenizer":
-        chars = sorted({char for text in texts for char in text})
-        token_to_id = {token: idx for idx, token in enumerate(SPECIAL_TOKENS + chars)}
-        corpus = [list(text) + ["<eos>"] for text in texts if text]
-        merges: list[tuple[str, str]] = []
-
-        while len(token_to_id) < vocab_size:
-            pair_counts: Counter[tuple[str, str]] = Counter()
-            for tokens in corpus:
-                pair_counts.update(zip(tokens, tokens[1:]))
-            if not pair_counts:
-                break
-
-            (left, right), count = pair_counts.most_common(1)[0]
-            if count < min_pair_freq:
-                break
-
-            merged = left + right
-            if merged in token_to_id:
-                break
-
-            token_to_id[merged] = len(token_to_id)
-            merges.append((left, right))
-            for index, tokens in enumerate(corpus):
-                corpus[index] = _merge_pair(tokens, left, right, merged)
-
-        while len(token_to_id) < vocab_size:
-            token_to_id[f"<unused_{len(token_to_id)}>"] = len(token_to_id)
-
-        return cls(token_to_id, merges, vocab_size)
+    def train(cls, texts: list[str], vocab_size: int = 16000) -> "BPETokenizer":
+        tokenizer = Tokenizer(BPE(unk_token="<unk>"))
+        tokenizer.pre_tokenizer = ByteLevel(add_prefix_space=False)
+        tokenizer.decoder = ByteLevelDecoder()
+        trainer = BpeTrainer(
+            vocab_size=vocab_size,
+            min_frequency=2,
+            special_tokens=SPECIAL_TOKENS,
+            show_progress=True,
+        )
+        tokenizer.train_from_iterator((text for text in texts if text), trainer=trainer)
+        return cls(tokenizer, target_vocab_size=vocab_size)
 
     def encode(self, text: str, add_bos: bool = False, add_eos: bool = False) -> list[int]:
-        tokens = list(text)
-        for left, right in self.merges:
-            tokens = _merge_pair(tokens, left, right, left + right)
-
-        ids = [self.token_to_id.get(token, self.unk_id) for token in tokens]
+        ids = self.tokenizer.encode(text, add_special_tokens=False).ids
         if add_bos:
             ids.insert(0, self.bos_id)
         if add_eos:
@@ -97,55 +82,63 @@ class BPETokenizer:
         return ids
 
     def decode(self, ids: list[int]) -> str:
-        parts: list[str] = []
-        for idx in ids:
-            token = self.id_to_token.get(int(idx), "<unk>")
-            if token in SPECIAL_TOKENS or token.startswith("<unused_"):
-                continue
-            parts.append(token)
-        return "".join(parts)
+        filtered = [
+            int(idx)
+            for idx in ids
+            if int(idx) not in {self.pad_id, self.unk_id, self.bos_id, self.eos_id}
+        ]
+        return self.tokenizer.decode(filtered, skip_special_tokens=True)
 
     def save(self, path: str | Path) -> None:
-        payload = {
-            "target_vocab_size": self.target_vocab_size,
-            "token_to_id": self.token_to_id,
-            "merges": self.merges,
-        }
-        Path(path).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.tokenizer.save(str(path))
+        meta_path(path).write_text(
+            json.dumps({"target_vocab_size": self.target_vocab_size}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
     @classmethod
     def load(cls, path: str | Path) -> "BPETokenizer":
-        payload = json.loads(Path(path).read_text(encoding="utf-8"))
-        return cls(
-            token_to_id={str(key): int(value) for key, value in payload["token_to_id"].items()},
-            merges=[tuple(pair) for pair in payload["merges"]],
-            target_vocab_size=int(payload.get("target_vocab_size", 16000)),
-        )
+        path = Path(path)
+        target_vocab_size = 16000
+        if meta_path(path).exists():
+            payload = json.loads(meta_path(path).read_text(encoding="utf-8"))
+            target_vocab_size = int(payload.get("target_vocab_size", target_vocab_size))
+        return cls(Tokenizer.from_file(str(path)), target_vocab_size=target_vocab_size)
 
 
-def _merge_pair(tokens: list[str], left: str, right: str, merged: str) -> list[str]:
-    result: list[str] = []
-    index = 0
-    while index < len(tokens):
-        if index + 1 < len(tokens) and tokens[index] == left and tokens[index + 1] == right:
-            result.append(merged)
-            index += 2
-        else:
-            result.append(tokens[index])
-            index += 1
-    return result
+def meta_path(path: Path) -> Path:
+    return path.with_suffix(path.suffix + ".meta")
 
 
-def corpus_stats(tokenizer: BPETokenizer, texts: list[tuple[Path, str]]) -> dict[str, int | float]:
+def corpus_stats(tokenizer: BPETokenizer, texts: list[tuple[Path, str]]) -> dict[str, int | float | str]:
     encoded_lengths = [len(tokenizer.encode(text, add_bos=True, add_eos=True)) for _, text in texts]
     total_tokens = sum(encoded_lengths)
-    longest_context = max(encoded_lengths, default=0)
+    longest_index = max(range(len(encoded_lengths)), key=encoded_lengths.__getitem__, default=-1)
+    longest_context = encoded_lengths[longest_index] if longest_index >= 0 else 0
     token_memory_mb = total_tokens * 8 / (1024 * 1024)
     return {
         "files": len(texts),
         "chars": sum(len(text) for _, text in texts),
         "tokens": total_tokens,
         "longest_context": longest_context,
+        "longest_file": str(texts[longest_index][0]) if longest_index >= 0 else "",
+        "token_memory_mb": round(token_memory_mb, 3),
+    }
+
+
+def ids_corpus_stats(samples: list[tuple[Path, list[int]]]) -> dict[str, int | float | str]:
+    lengths = [len(ids) for _, ids in samples]
+    total_tokens = sum(lengths)
+    longest_index = max(range(len(lengths)), key=lengths.__getitem__, default=-1)
+    longest_context = lengths[longest_index] if longest_index >= 0 else 0
+    token_memory_mb = total_tokens * 8 / (1024 * 1024)
+    return {
+        "files": len(samples),
+        "tokens": total_tokens,
+        "longest_context": longest_context,
+        "longest_file": str(samples[longest_index][0]) if longest_index >= 0 else "",
         "token_memory_mb": round(token_memory_mb, 3),
     }
 
@@ -160,6 +153,5 @@ def load_or_train_tokenizer(
         return BPETokenizer.load(path)
 
     tokenizer = BPETokenizer.train([text for _, text in texts], vocab_size=vocab_size)
-    path.parent.mkdir(parents=True, exist_ok=True)
     tokenizer.save(path)
     return tokenizer

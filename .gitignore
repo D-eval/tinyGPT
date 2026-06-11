@@ -1,2 +1,12 @@
+dataset2/data/
+dataset2/preprocess10000/
+
 *.pt
 *.json
+*.jsonl
+
+__pycache__/
+*.py[cod]
+*.log
+loss.png
+preprocess/

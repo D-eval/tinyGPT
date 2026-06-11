@@ -6,7 +6,7 @@ from pathlib import Path
 import torch
 
 from read import BPETokenizer
-from model import TinyGPT
+from model import TinyGPT, checkpoint_model_config, checkpoint_model_state
 from train import MODEL_PATH, TOKENIZER_PATH, choose_device
 
 
@@ -24,8 +24,8 @@ def main() -> None:
 
     tokenizer = BPETokenizer.load(TOKENIZER_PATH)
     checkpoint = torch.load(MODEL_PATH, map_location="cpu")
-    model = TinyGPT(**checkpoint["config"])
-    model.load_state_dict(checkpoint["model_state"])
+    model = TinyGPT(**checkpoint_model_config(checkpoint))
+    model.load_state_dict(checkpoint_model_state(checkpoint, model), strict=False)
     device = choose_device()
     model.to(device)
 
