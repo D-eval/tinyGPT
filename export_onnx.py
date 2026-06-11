@@ -7,6 +7,7 @@ import types
 from pathlib import Path
 
 import torch
+import onnx
 from torch.nn import functional as F
 
 from model import CausalSelfAttention
@@ -76,7 +77,10 @@ def export_onnx(
         },
         opset_version=opset,
         do_constant_folding=True,
+        external_data=False,
     )
+    packed = onnx.load(output_path, load_external_data=True)
+    onnx.save_model(packed, output_path, save_as_external_data=False)
 
     metadata = {
         "model_path": str(model_path),
