@@ -13,3 +13,5 @@ __pycache__/
 *.log
 loss.png
 preprocess/
+
+*.tgz
