@@ -237,3 +237,33 @@ https://huggingface.co/BoiWanKenobi/myNovelGPT/resolve/main/tinygpt.onnx.json
 nohup python3 -u train2.py --max-epochs 5000 > train2.log 2>&1 &
 
 nohup python3 -u preprocess.py --max-epochs 5000 > preprocess.log 2>&1 &
+
+这个 tokenizer 太大了，导致模型变得很大，不用兼容之前的 tokenizer 了，重新训练 tokenizer，写在 train_tokenizer.py 里，统计 read_union 的数据，得到 tokenizer2.json，保持 vocab_size = 16000
+
+nohup python3 -u train_tokenizer.py --vocab-size 16000 --out params/tokenizer2.json --stats-out params/tokenizer2_stats.json --progress-every 10000  > train_tokenizer.log 2>&1 &
+
+
+
+nohup python3 -u dataset2/preprocess.py > preprocess.log 2>&1 &
+
+
+
+nohup python3 -u train_tokenizer.py --vocab-size 16000 --out params/tokenizer2.json --stats-out params/tokenizer2_stats.json --progress-every 10000 > train_tokenizer.log 2>&1 &
+nohup python3 -u dataset2/preprocess.py > preprocess.log 2>&1 &
+nohup python3 -u train2.py --max-epochs 5000 > train2.log 2>&1 &
+
+
+nohup bash -c '
+python3 -u train_tokenizer.py \
+    --vocab-size 16000 \
+    --out params/tokenizer2.json \
+    --stats-out params/tokenizer2_stats.json \
+    --progress-every 10000 &&
+python3 -u dataset2/preprocess.py &&
+python3 -u train2.py --max-epochs 5000
+' > pipeline.log 2>&1 &
+
+nohup bash -c '
+python3 -u dataset2/preprocess.py &&
+python3 -u train2.py --max-epochs 5000
+' > pipeline.log 2>&1 &

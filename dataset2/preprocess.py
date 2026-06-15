@@ -1,35 +1,24 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from array import array
-from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import BinaryIO
-
-from tokenizers import Tokenizer
-from tokenizers.decoders import ByteLevel as ByteLevelDecoder
-from tokenizers.models import BPE
-from tokenizers.pre_tokenizers import ByteLevel
-from tokenizers.trainers import BpeTrainer
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from dataset2.read import (  # noqa: E402
-    DATA_DIR,
-    DEFAULT_CONTEXT_LENGTH,
-    Dataset,
-    load_indexed_text,
-    token_preprocess_dir,
-    token_shard_prefix,
-)
-from read import BPETokenizer, SPECIAL_TOKENS  # noqa: E402
+from dataset2.read import DEFAULT_CONTEXT_LENGTH, token_preprocess_dir  # noqa: E402
+from read import BPETokenizer  # noqa: E402
+from train_tokenizer import iter_dataset2_raw_texts  # noqa: E402
 
 
+DATA_DIR = Path(__file__).resolve().parent / "data"
 TOKENIZER_PATH = ROOT_DIR / "params" / "tokenizer2.json"
 VOCAB_SIZE = 16_000
 TOKEN_DTYPE = "uint32"
@@ -38,52 +27,52 @@ PREVIEW_CHARS = 160
 PREVIEW_TOKENS = 40
 
 
-def dataset2_text_iter(dataset_dir: str | Path, rebuild_index: bool = False) -> Iterator[tuple[Path, str]]:
-    dataset = Dataset(dataset_dir, rebuild_index=rebuild_index, lazy=True)
-    for path, text in dataset:
-        text = text.strip()
-        if text:
-            yield path, text
-
-
-def train_streaming_tokenizer(
-    sample_iter: Iterable[tuple[Path, str]],
-    tokenizer_path: str | Path = TOKENIZER_PATH,
-    vocab_size: int = VOCAB_SIZE,
-) -> BPETokenizer:
-    tokenizer = Tokenizer(BPE(unk_token="<unk>"))
-    tokenizer.pre_tokenizer = ByteLevel(add_prefix_space=False)
-    tokenizer.decoder = ByteLevelDecoder()
-    trainer = BpeTrainer(
-        vocab_size=vocab_size,
-        min_frequency=2,
-        special_tokens=SPECIAL_TOKENS,
-        show_progress=True,
-    )
-    tokenizer.train_from_iterator((text for _, text in sample_iter if text), trainer=trainer)
-    wrapped = BPETokenizer(tokenizer, target_vocab_size=vocab_size)
-    wrapped.save(tokenizer_path)
-    return wrapped
-
-
-def load_or_train_tokenizer(
-    tokenizer_path: str | Path,
-    dataset_dir: str | Path,
-    vocab_size: int,
-    rebuild_index: bool = False,
-) -> BPETokenizer:
-    path = Path(tokenizer_path)
-    if path.exists():
-        return BPETokenizer.load(path)
-    return train_streaming_tokenizer(
-        dataset2_text_iter(dataset_dir, rebuild_index=rebuild_index),
-        path,
-        vocab_size,
-    )
-
-
 def compact_preview(text: str, limit: int) -> str:
     return " ".join(text.split())[:limit]
+
+
+def tokenizer_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def safe_stem(path: Path) -> str:
+    return "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in path.stem)
+
+
+def token_shard_prefix(
+    source_path: Path,
+    context_length: int,
+    dataset_dir: Path,
+    preprocess_dir: Path,
+) -> Path:
+    relative = source_path.relative_to(dataset_dir)
+    parent = relative.parent.name
+    name = safe_stem(source_path)
+    if parent:
+        name = f"{parent}__{name}"
+    return preprocess_dir / name
+
+
+def complete_path(prefix: Path) -> Path:
+    return prefix.with_suffix(".complete")
+
+
+def source_is_complete(prefix: Path, tokenizer_hash: str, force: bool) -> bool:
+    if force:
+        return False
+    done_path = complete_path(prefix)
+    meta_path = prefix.with_suffix(".meta.json")
+    if not done_path.exists() or not meta_path.exists():
+        return False
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return False
+    return meta.get("tokenizer_sha256") == tokenizer_hash
 
 
 def print_tokenizer_preview(
@@ -112,10 +101,6 @@ def print_tokenizer_preview(
     )
 
 
-def complete_path(prefix: Path) -> Path:
-    return prefix.with_suffix(".complete")
-
-
 class FixedContextTokenShardWriter:
     def __init__(
         self,
@@ -124,12 +109,14 @@ class FixedContextTokenShardWriter:
         source_path: Path,
         data_name: str,
         tokenizer_path: Path,
+        tokenizer_hash: str,
     ) -> None:
         self.prefix = prefix
         self.context_length = context_length
         self.source_path = source_path
         self.data_name = data_name
         self.tokenizer_path = tokenizer_path
+        self.tokenizer_hash = tokenizer_hash
         self.bin_path = prefix.with_suffix(".bin")
         self.idx_path = prefix.with_suffix(".idx")
         self.meta_path = prefix.with_suffix(".meta.json")
@@ -176,6 +163,7 @@ class FixedContextTokenShardWriter:
                     "bin_path": str(self.bin_path),
                     "idx_path": str(self.idx_path),
                     "tokenizer_path": str(self.tokenizer_path),
+                    "tokenizer_sha256": self.tokenizer_hash,
                     "context_length": self.context_length,
                     "token_dtype": TOKEN_DTYPE,
                     "index_dtype": INDEX_DTYPE,
@@ -207,6 +195,7 @@ class FixedContextTokenShardWriter:
                     "sample_count": self.sample_count,
                     "token_count": self.token_count,
                     "context_length": self.context_length,
+                    "tokenizer_sha256": self.tokenizer_hash,
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -216,9 +205,10 @@ class FixedContextTokenShardWriter:
 
 
 def preprocess_by_file(
-    dataset: Dataset,
+    dataset_dir: Path,
     tokenizer: BPETokenizer,
     tokenizer_path: Path,
+    tokenizer_hash: str,
     context_length: int,
     preprocess_dir: Path,
     max_samples: int | None = None,
@@ -229,38 +219,36 @@ def preprocess_by_file(
 ) -> dict[str, int]:
     writers: list[FixedContextTokenShardWriter] = []
     writer: FixedContextTokenShardWriter | None = None
+    current_prefix: Path | None = None
     current_source_path: Path | None = None
     rows_seen = 0
     skipped = 0
     skipped_completed = 0
     stopped_early = False
-    try:
-        for row in dataset.iter_rows():
-            if max_samples is not None and rows_seen >= max_samples:
-                stopped_early = True
-                break
-            rows_seen += 1
-            source_path = Path(row["path"])
 
-            if current_source_path is not None and source_path != current_source_path and writer is not None:
+    try:
+        for _, source_path, text in iter_dataset2_raw_texts(dataset_dir, max_samples=max_samples):
+            rows_seen += 1
+            prefix = token_shard_prefix(
+                source_path=source_path,
+                context_length=context_length,
+                dataset_dir=dataset_dir,
+                preprocess_dir=preprocess_dir,
+            )
+
+            if current_prefix is not None and current_prefix != prefix and writer is not None:
                 writer.mark_complete()
                 print(f"complete data_name={writer.data_name} path={complete_path(writer.prefix)}", flush=True)
                 writer = None
+                current_prefix = None
                 current_source_path = None
 
-            prefix = token_shard_prefix(
-                source_path,
-                context_length=context_length,
-                dataset_dir=dataset.dataset_dir,
-                preprocess_dir=preprocess_dir,
-            )
-            done_path = complete_path(prefix)
-            if done_path.exists() and not force:
+            if source_is_complete(prefix, tokenizer_hash, force):
                 skipped_completed += 1
                 continue
 
-            text = load_indexed_text(row).strip()
-            if not text:
+            token_ids = tokenizer.encode(text, add_bos=True, add_eos=True)
+            if not token_ids:
                 skipped += 1
                 continue
 
@@ -271,10 +259,12 @@ def preprocess_by_file(
                     source_path=source_path,
                     data_name=prefix.name,
                     tokenizer_path=tokenizer_path,
+                    tokenizer_hash=tokenizer_hash,
                 )
                 writers.append(writer)
+                current_prefix = prefix
                 current_source_path = source_path
-            token_ids = tokenizer.encode(text, add_bos=True, add_eos=True)
+
             writer.write_tokens(token_ids)
             if progress_every > 0 and rows_seen % progress_every == 0:
                 sample_count = sum(item.sample_count for item in writers)
@@ -292,6 +282,9 @@ def preprocess_by_file(
                     preview_chars,
                     preview_tokens,
                 )
+
+        if max_samples is not None and rows_seen >= max_samples:
+            stopped_early = True
     except Exception:
         if writer is not None:
             writer.close()
@@ -308,6 +301,7 @@ def preprocess_by_file(
         "dataset": "dataset2",
         "context_length": context_length,
         "tokenizer_path": str(tokenizer_path),
+        "tokenizer_sha256": tokenizer_hash,
         "shard_count": len(writers),
         "input_rows": rows_seen,
         "skipped_rows": skipped,
@@ -344,34 +338,31 @@ def preprocess_by_file(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Preprocess dataset2 into one bin/idx pair per source data file.")
+    parser = argparse.ArgumentParser(description="Preprocess dataset2 raw JSON/JSONL files into bin+idx token shards.")
     parser.add_argument("--dataset-dir", type=Path, default=DATA_DIR)
     parser.add_argument("--tokenizer", type=Path, default=TOKENIZER_PATH)
     parser.add_argument("--context-length", type=int, default=DEFAULT_CONTEXT_LENGTH)
     parser.add_argument("--out-dir", type=Path, default=None, help="defaults to dataset2/preprocess{context_length}")
-    parser.add_argument("--vocab-size", type=int, default=VOCAB_SIZE)
-    parser.add_argument("--rebuild-index", action="store_true")
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--progress-every", type=int, default=10_000)
     parser.add_argument("--preview-chars", type=int, default=PREVIEW_CHARS)
     parser.add_argument("--preview-tokens", type=int, default=PREVIEW_TOKENS)
-    parser.add_argument("--force", action="store_true", help="rewrite shards even when {data_name}.complete exists")
+    parser.add_argument("--force", action="store_true", help="rewrite shards even when tokenizer hash matches")
     args = parser.parse_args()
 
+    if not args.tokenizer.exists():
+        raise SystemExit(f"missing tokenizer: {args.tokenizer}. Run train_tokenizer.py first.")
+
     out_dir = args.out_dir or token_preprocess_dir(args.context_length)
-    tokenizer = load_or_train_tokenizer(
-        args.tokenizer,
-        args.dataset_dir,
-        args.vocab_size,
-        rebuild_index=args.rebuild_index,
-    )
-    dataset = Dataset(args.dataset_dir, rebuild_index=args.rebuild_index, lazy=True)
+    tokenizer_hash = tokenizer_sha256(args.tokenizer)
+    tokenizer = BPETokenizer.load(args.tokenizer)
     counts = preprocess_by_file(
-        dataset,
-        tokenizer,
-        args.tokenizer,
-        args.context_length,
-        out_dir,
+        dataset_dir=args.dataset_dir,
+        tokenizer=tokenizer,
+        tokenizer_path=args.tokenizer,
+        tokenizer_hash=tokenizer_hash,
+        context_length=args.context_length,
+        preprocess_dir=out_dir,
         max_samples=args.max_samples,
         progress_every=args.progress_every,
         preview_chars=args.preview_chars,
@@ -383,6 +374,9 @@ def main() -> None:
             {
                 "counts": counts,
                 "out_dir": str(out_dir),
+                "tokenizer_path": str(args.tokenizer),
+                "tokenizer_sha256": tokenizer_hash,
+                "tokenizer_vocab_size": tokenizer.vocab_size,
             },
             ensure_ascii=False,
             indent=2,

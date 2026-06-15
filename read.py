@@ -10,7 +10,7 @@ from tokenizers.pre_tokenizers import ByteLevel
 from tokenizers.trainers import BpeTrainer
 
 
-SPECIAL_TOKENS = ["<pad>", "<unk>", "<bos>", "<eos>"]
+SPECIAL_TOKENS = ["<pad>", "<unk>", "<bos>", "<eos>", "<agent>", "<usr>", "<system>"]
 
 
 def find_text_files(dataset_dir: str | Path = "dataset") -> list[Path]:
@@ -54,6 +54,9 @@ class BPETokenizer:
         self.unk_id = vocab["<unk>"]
         self.bos_id = vocab["<bos>"]
         self.eos_id = vocab["<eos>"]
+        self.agent_id = vocab.get("<agent>")
+        self.usr_id = vocab.get("<usr>")
+        self.system_id = vocab.get("<system>")
 
     @property
     def vocab_size(self) -> int:
@@ -81,11 +84,26 @@ class BPETokenizer:
             ids.append(self.eos_id)
         return ids
 
+    def special_id(self, token: str) -> int:
+        token_id = self.tokenizer.token_to_id(token)
+        if token_id is None:
+            raise KeyError(f"Missing special token {token!r} in tokenizer.")
+        return int(token_id)
+
     def decode(self, ids: list[int]) -> str:
         filtered = [
             int(idx)
             for idx in ids
-            if int(idx) not in {self.pad_id, self.unk_id, self.bos_id, self.eos_id}
+            if int(idx)
+            not in {
+                self.pad_id,
+                self.unk_id,
+                self.bos_id,
+                self.eos_id,
+                self.agent_id,
+                self.usr_id,
+                self.system_id,
+            }
         ]
         return self.tokenizer.decode(filtered, skip_special_tokens=True)
 

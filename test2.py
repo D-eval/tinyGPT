@@ -24,6 +24,14 @@ from train2 import (
 )
 
 
+DEFAULT_SYSTEM_PROMPT = "You are a helpful dialogue agent. Respond naturally across the full conversation."
+DEFAULT_DIALOGUE_PROMPTS = [
+    "你好，今天我有点累，但又不想浪费这个晚上。",
+    "如果我想慢慢把生活整理好，你会建议我先做什么？",
+    "你能用更轻松一点的语气继续陪我聊吗？",
+]
+
+
 def resolve_device(requested: str | None = None) -> torch.device:
     if requested is None:
         return choose_device()
@@ -48,8 +56,16 @@ def load_tinygpt(model_path: Path, tokenizer_path: Path, device: torch.device) -
     tokenizer = BPETokenizer.load(tokenizer_path)
     checkpoint = torch.load(model_path, map_location=device)
     config = checkpoint_model_config(checkpoint)
+    if int(config["vocab_size"]) != tokenizer.vocab_size:
+        config = {**config, "vocab_size": tokenizer.vocab_size}
     model = TinyGPT(**config)
-    model.load_state_dict(checkpoint_model_state(checkpoint, model), strict=False)
+    expected = model.state_dict()
+    loadable = {
+        key: value
+        for key, value in checkpoint_model_state(checkpoint, model).items()
+        if key in expected and expected[key].shape == value.shape
+    }
+    model.load_state_dict(loadable, strict=False)
     model.to(device)
     model.eval()
     return tokenizer, model, config
@@ -110,6 +126,7 @@ def continue_text(
     max_new_tokens: int,
     temperature: float,
     top_k: int | None,
+    stop_token_ids: set[int] | None = None,
 ) -> torch.Tensor:
     for _ in range(max_new_tokens):
         context = idx[:, -model.block_size :]
@@ -121,6 +138,8 @@ def continue_text(
         probs = F.softmax(logits, dim=-1)
         next_id = torch.multinomial(probs, num_samples=1)
         idx = torch.cat([idx, next_id], dim=1)
+        if stop_token_ids is not None and int(next_id.item()) in stop_token_ids:
+            break
     return idx
 
 
@@ -146,24 +165,54 @@ def run_continuation(args: argparse.Namespace) -> None:
     print(tokenizer.decode(generated[0].detach().cpu().tolist()))
 
 
-def format_chat_prompt(history: list[tuple[str, str]], user_text: str) -> str:
-    lines: list[str] = []
+def append_role_prefix(tokenizer: BPETokenizer, ids: list[int], role_token: str) -> None:
+    ids.append(tokenizer.special_id(role_token))
+    ids.extend(tokenizer.encode(": "))
+
+
+def encode_chat_prompt(
+    tokenizer: BPETokenizer,
+    system_prompt: str,
+    history: list[tuple[str, str]],
+    user_text: str,
+    add_bos: bool,
+) -> list[int]:
+    ids = [tokenizer.bos_id] if add_bos else []
+    append_role_prefix(tokenizer, ids, "<system>")
+    ids.extend(tokenizer.encode(system_prompt.strip()))
     for user, assistant in history:
-        lines.append(f"用户：{user}")
-        lines.append(f"助手：{assistant}")
-    lines.append(f"用户：{user_text}")
-    lines.append("助手：")
-    return "\n".join(lines)
+        ids.extend(tokenizer.encode("\n"))
+        append_role_prefix(tokenizer, ids, "<usr>")
+        ids.extend(tokenizer.encode(user.strip()))
+        ids.extend(tokenizer.encode("\n"))
+        append_role_prefix(tokenizer, ids, "<agent>")
+        ids.append(tokenizer.bos_id)
+        ids.extend(tokenizer.encode(assistant.strip()))
+        ids.append(tokenizer.eos_id)
+    ids.extend(tokenizer.encode("\n"))
+    append_role_prefix(tokenizer, ids, "<usr>")
+    ids.extend(tokenizer.encode(user_text.strip()))
+    ids.extend(tokenizer.encode("\n"))
+    append_role_prefix(tokenizer, ids, "<agent>")
+    ids.append(tokenizer.bos_id)
+    return ids
 
 
-def trim_response(text: str) -> str:
-    markers = ("\n用户：", "\nUser:", "\nuser:", "\n### 用户", "\nHuman:")
-    end = len(text)
-    for marker in markers:
-        pos = text.find(marker)
-        if pos >= 0:
-            end = min(end, pos)
-    return text[:end].strip()
+def decode_chat_response(tokenizer: BPETokenizer, generated_ids: list[int]) -> str:
+    stop_ids = {
+        tokenizer.eos_id,
+        tokenizer.special_id("<usr>"),
+        tokenizer.special_id("<agent>"),
+        tokenizer.special_id("<system>"),
+    }
+    trimmed: list[int] = []
+    for token_id in generated_ids:
+        if int(token_id) in stop_ids:
+            break
+        trimmed.append(int(token_id))
+    if trimmed and trimmed[0] == tokenizer.bos_id:
+        trimmed = trimmed[1:]
+    return tokenizer.decode(trimmed).strip()
 
 
 def run_chat(args: argparse.Namespace) -> None:
@@ -187,8 +236,13 @@ def run_chat(args: argparse.Namespace) -> None:
         if user_text.lower() in {"exit", "quit", "q"}:
             break
 
-        prompt = format_chat_prompt(history[-args.history_turns :], user_text)
-        ids = tokenizer.encode(prompt, add_bos=not args.no_bos)
+        ids = encode_chat_prompt(
+            tokenizer,
+            args.system_prompt,
+            history[-args.history_turns :],
+            user_text,
+            add_bos=not args.no_bos,
+        )
         if not ids:
             ids = [tokenizer.bos_id]
         idx = torch.tensor([ids], dtype=torch.long, device=device)
@@ -198,13 +252,54 @@ def run_chat(args: argparse.Namespace) -> None:
             max_new_tokens=args.tokens,
             temperature=args.temperature,
             top_k=args.top_k,
+            stop_token_ids={tokenizer.eos_id},
         )
         generated_ids = generated[0, len(ids) :].detach().cpu().tolist()
-        answer = trim_response(tokenizer.decode(generated_ids))
+        answer = decode_chat_response(tokenizer, generated_ids)
         if not answer:
-            answer = tokenizer.decode(generated[0].detach().cpu().tolist()).strip()
+            answer = tokenizer.decode(generated_ids).strip()
         print(f"助手：{answer}", flush=True)
         history.append((user_text, answer))
+
+
+def run_dialogue_sample(args: argparse.Namespace) -> None:
+    device = resolve_device(args.device)
+    if args.seed is not None:
+        torch.manual_seed(args.seed)
+        if device.type == "cuda":
+            torch.cuda.manual_seed_all(args.seed)
+
+    tokenizer, model, _ = load_tinygpt(args.model, args.tokenizer, device)
+    prompts = list(args.dialogue_prompts or DEFAULT_DIALOGUE_PROMPTS)
+    if args.prompt is not None:
+        prompts = [args.prompt, *prompts]
+    prompts = prompts[: max(args.turns, 0)]
+    history: list[tuple[str, str]] = []
+
+    print("<dialogue>", flush=True)
+    for user_text in prompts:
+        ids = encode_chat_prompt(
+            tokenizer,
+            args.system_prompt,
+            history[-args.history_turns :],
+            user_text,
+            add_bos=not args.no_bos,
+        )
+        idx = torch.tensor([ids], dtype=torch.long, device=device)
+        generated = continue_text(
+            model,
+            idx,
+            max_new_tokens=args.tokens,
+            temperature=args.temperature,
+            top_k=args.top_k,
+            stop_token_ids={tokenizer.eos_id},
+        )
+        generated_ids = generated[0, len(ids) :].detach().cpu().tolist()
+        answer = decode_chat_response(tokenizer, generated_ids)
+        print(f"<usr>: {user_text}", flush=True)
+        print(f"<agent>: {answer}", flush=True)
+        history.append((user_text, answer))
+    print("</dialogue>", flush=True)
 
 
 def main() -> None:
@@ -226,13 +321,23 @@ def main() -> None:
     parser.add_argument("--device", choices=["cpu", "cuda", "mps"], default=None)
     parser.add_argument("--no-bos", action="store_true", help="do not prepend the BOS token to the prompt")
     parser.add_argument("--chat", action="store_true", help="run interactive dialogue test")
+    parser.add_argument("--dialogue", action="store_true", help="run scripted multi-turn dialogue sampling")
+    parser.add_argument("--turns", type=int, default=3, help="number of scripted dialogue turns to sample")
     parser.add_argument("--history-turns", type=int, default=4, help="number of previous dialogue turns to keep")
+    parser.add_argument("--system-prompt", default=DEFAULT_SYSTEM_PROMPT)
+    parser.add_argument("--dialogue-prompts", nargs="*", default=None, help="user turns for scripted dialogue sampling")
     args = parser.parse_args()
 
     if args.chat:
         if args.check:
             check_stage3_artifacts(args.model, args.tokenizer, args.result, args.skip_thresholds, args.smoke_tokens)
         run_chat(args)
+        return
+
+    if args.dialogue:
+        if args.check:
+            check_stage3_artifacts(args.model, args.tokenizer, args.result, args.skip_thresholds, args.smoke_tokens)
+        run_dialogue_sample(args)
         return
 
     if args.prompt is None:
