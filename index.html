@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>TinyGPT 续写</title>
+  <title>TinyGPT</title>
   <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
   <style>
     :root {
@@ -36,23 +36,112 @@
       gap: 14px;
     }
 
-    textarea {
-      width: 100%;
-      min-height: 52vh;
-      box-sizing: border-box;
-      resize: vertical;
+    .mode-switch {
+      display: inline-flex;
+      width: fit-content;
       border: 1px solid #cdd3dc;
       border-radius: 8px;
-      padding: 16px;
-      font: 16px/1.65 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      overflow: hidden;
+      background: #fff;
+    }
+
+    .mode-button {
+      height: 38px;
+      border: 0;
+      border-radius: 0;
+      padding: 0 16px;
+      background: transparent;
+      color: #374151;
+      font-size: 15px;
+      font-weight: 650;
+      cursor: pointer;
+    }
+
+    .mode-button.active {
+      background: #1f6feb;
+      color: #fff;
+    }
+
+    textarea,
+    input[type="text"] {
+      width: 100%;
+      box-sizing: border-box;
+      border: 1px solid #cdd3dc;
+      border-radius: 8px;
       color: #181b20;
       background: #fff;
       outline: none;
     }
 
-    textarea:focus {
+    textarea {
+      min-height: 52vh;
+      resize: vertical;
+      padding: 16px;
+      font: 16px/1.65 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    }
+
+    input[type="text"] {
+      height: 40px;
+      padding: 0 12px;
+      font-size: 15px;
+    }
+
+    textarea:focus,
+    input[type="text"]:focus {
       border-color: #2f6feb;
       box-shadow: 0 0 0 3px rgba(47, 111, 235, 0.14);
+    }
+
+    .hidden {
+      display: none !important;
+    }
+
+    .chat-panel {
+      display: grid;
+      gap: 12px;
+    }
+
+    .chat-log {
+      min-height: 46vh;
+      max-height: 58vh;
+      overflow: auto;
+      border: 1px solid #cdd3dc;
+      border-radius: 8px;
+      padding: 14px;
+      background: #fff;
+      box-sizing: border-box;
+    }
+
+    .message {
+      display: grid;
+      gap: 5px;
+      margin: 0 0 14px;
+    }
+
+    .message:last-child {
+      margin-bottom: 0;
+    }
+
+    .role {
+      color: #69717d;
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .bubble {
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      border-radius: 8px;
+      padding: 10px 12px;
+      font: 15px/1.6 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    .user .bubble {
+      background: #edf4ff;
+    }
+
+    .assistant .bubble {
+      background: #f1f3f5;
     }
 
     .controls {
@@ -108,14 +197,30 @@
 </head>
 <body>
   <main>
-    <h1>TinyGPT 续写</h1>
+    <h1>TinyGPT</h1>
     <section class="workspace">
-      <textarea id="prompt" spellcheck="false" placeholder="写一段话，然后点击续写。"></textarea>
+      <div class="mode-switch" role="tablist" aria-label="生成模式">
+        <button id="continueModeButton" class="mode-button active" type="button" role="tab" aria-selected="true">续写模式</button>
+        <button id="chatModeButton" class="mode-button" type="button" role="tab" aria-selected="false">对话模式</button>
+      </div>
+
+      <div id="continuePanel">
+        <textarea id="prompt" spellcheck="false" placeholder="写一段话，然后点击续写。"></textarea>
+      </div>
+
+      <div id="chatPanel" class="chat-panel hidden">
+        <div id="chatLog" class="chat-log" aria-live="polite"></div>
+        <input id="systemPrompt" type="text" value="You are a helpful dialogue agent. Respond naturally across the full conversation." aria-label="system prompt">
+        <textarea id="chatInput" spellcheck="false" placeholder="输入消息，然后点击发送。"></textarea>
+      </div>
+
       <div class="controls">
-        <button id="continueButton" type="button">续写</button>
+        <button id="generateButton" type="button">续写</button>
         <label>生成 token <input id="maxTokens" type="number" min="1" max="300" value="80"></label>
         <label>temperature <input id="temperature" type="number" min="0.1" max="2" step="0.1" value="0.9"></label>
         <label>top-k <input id="topK" type="number" min="0" max="200" step="1" value="50"></label>
+        <label id="historyTurnsLabel" class="hidden">历史轮数 <input id="historyTurns" type="number" min="0" max="20" step="1" value="4"></label>
+        <button id="clearChatButton" class="hidden" type="button">清空对话</button>
       </div>
       <div id="status" class="status">等待加载模型...</div>
     </section>
@@ -132,7 +237,17 @@
     const TOKENIZER_URL = assetUrl("tokenizer", "https://huggingface.co/BoiWanKenobi/myNovelGPT/resolve/main/params/tokenizer2.json");
 
     const promptEl = document.getElementById("prompt");
-    const buttonEl = document.getElementById("continueButton");
+    const continuePanelEl = document.getElementById("continuePanel");
+    const chatPanelEl = document.getElementById("chatPanel");
+    const continueModeButtonEl = document.getElementById("continueModeButton");
+    const chatModeButtonEl = document.getElementById("chatModeButton");
+    const buttonEl = document.getElementById("generateButton");
+    const chatLogEl = document.getElementById("chatLog");
+    const chatInputEl = document.getElementById("chatInput");
+    const systemPromptEl = document.getElementById("systemPrompt");
+    const clearChatButtonEl = document.getElementById("clearChatButton");
+    const historyTurnsEl = document.getElementById("historyTurns");
+    const historyTurnsLabelEl = document.getElementById("historyTurnsLabel");
     const statusEl = document.getElementById("status");
     const maxTokensEl = document.getElementById("maxTokens");
     const temperatureEl = document.getElementById("temperature");
@@ -141,6 +256,8 @@
     let sessionPromise = null;
     let tokenizerPromise = null;
     let metadataPromise = null;
+    let mode = "continue";
+    let chatHistory = [];
 
     function assertHttpPage() {
       if (location.protocol === "file:") {
@@ -218,6 +335,10 @@
         return ids;
       }
 
+      specialId(token) {
+        return this.vocab[token];
+      }
+
       bpe(token) {
         if (this.cache.has(token)) return this.cache.get(token);
         let word = Array.from(token);
@@ -270,6 +391,88 @@
       }
     }
 
+    function setMode(nextMode) {
+      mode = nextMode;
+      const isChat = mode === "chat";
+      continuePanelEl.classList.toggle("hidden", isChat);
+      chatPanelEl.classList.toggle("hidden", !isChat);
+      historyTurnsLabelEl.classList.toggle("hidden", !isChat);
+      clearChatButtonEl.classList.toggle("hidden", !isChat);
+      continueModeButtonEl.classList.toggle("active", !isChat);
+      chatModeButtonEl.classList.toggle("active", isChat);
+      continueModeButtonEl.setAttribute("aria-selected", String(!isChat));
+      chatModeButtonEl.setAttribute("aria-selected", String(isChat));
+      buttonEl.textContent = isChat ? "发送" : "续写";
+    }
+
+    function appendRolePrefix(tokenizer, ids, roleToken) {
+      const roleId = tokenizer.specialId(roleToken);
+      if (roleId === undefined) throw new Error(`tokenizer 缺少特殊 token: ${roleToken}`);
+      ids.push(roleId);
+      ids.push(...tokenizer.encode(": ", false));
+    }
+
+    function encodeChatPrompt(tokenizer, systemPrompt, history, userText, addBos = true) {
+      const ids = addBos ? [tokenizer.bosId] : [];
+      appendRolePrefix(tokenizer, ids, "<system>");
+      ids.push(...tokenizer.encode(systemPrompt.trim(), false));
+      for (const item of history) {
+        ids.push(...tokenizer.encode("\n", false));
+        appendRolePrefix(tokenizer, ids, "<usr>");
+        ids.push(...tokenizer.encode(item.user.trim(), false));
+        ids.push(...tokenizer.encode("\n", false));
+        appendRolePrefix(tokenizer, ids, "<agent>");
+        ids.push(tokenizer.bosId);
+        ids.push(...tokenizer.encode(item.assistant.trim(), false));
+        ids.push(tokenizer.eosId);
+      }
+      ids.push(...tokenizer.encode("\n", false));
+      appendRolePrefix(tokenizer, ids, "<usr>");
+      ids.push(...tokenizer.encode(userText.trim(), false));
+      ids.push(...tokenizer.encode("\n", false));
+      appendRolePrefix(tokenizer, ids, "<agent>");
+      ids.push(tokenizer.bosId);
+      return ids;
+    }
+
+    function decodeChatResponse(tokenizer, generatedIds) {
+      const stopIds = new Set([
+        tokenizer.eosId,
+        tokenizer.specialId("<usr>"),
+        tokenizer.specialId("<agent>"),
+        tokenizer.specialId("<system>"),
+      ]);
+      const trimmed = [];
+      for (const id of generatedIds) {
+        if (stopIds.has(id)) break;
+        trimmed.push(id);
+      }
+      if (trimmed.length > 0 && trimmed[0] === tokenizer.bosId) trimmed.shift();
+      return tokenizer.decode(trimmed).trim();
+    }
+
+    function renderChat() {
+      chatLogEl.textContent = "";
+      for (const item of chatHistory) {
+        chatLogEl.appendChild(createMessage("user", "用户", item.user));
+        chatLogEl.appendChild(createMessage("assistant", "助手", item.assistant));
+      }
+      chatLogEl.scrollTop = chatLogEl.scrollHeight;
+    }
+
+    function createMessage(kind, role, text) {
+      const row = document.createElement("div");
+      row.className = `message ${kind}`;
+      const roleEl = document.createElement("div");
+      roleEl.className = "role";
+      roleEl.textContent = role;
+      const bubbleEl = document.createElement("div");
+      bubbleEl.className = "bubble";
+      bubbleEl.textContent = text;
+      row.append(roleEl, bubbleEl);
+      return row;
+    }
+
     async function loadEverything() {
       assertHttpPage();
       buttonEl.disabled = true;
@@ -317,7 +520,30 @@
       return candidates[candidates.length - 1][0];
     }
 
-    async function generate() {
+    async function runTokenLoop({ ids, maxNewTokens, temperature, topK, metadata, tokenizer, session, onToken, stopIds }) {
+      const blockSize = Number(metadata.block_size) || 10000;
+      const generatedIds = [];
+
+      for (let step = 0; step < maxNewTokens; step++) {
+        const context = ids.slice(Math.max(0, ids.length - blockSize));
+        const input = new ort.Tensor("int64", BigInt64Array.from(context.map(BigInt)), [1, context.length]);
+        const outputs = await session.run({ input_ids: input });
+        const logitsTensor = outputs.logits;
+        const vocabSize = logitsTensor.dims[2];
+        const offset = (logitsTensor.dims[1] - 1) * vocabSize;
+        const nextLogits = logitsTensor.data.slice(offset, offset + vocabSize);
+        const nextId = softmaxSample(nextLogits, temperature, topK);
+        ids.push(nextId);
+        generatedIds.push(nextId);
+        if (onToken) onToken(nextId, step + 1, generatedIds);
+        await new Promise((resolve) => requestAnimationFrame(resolve));
+        if (stopIds && stopIds.has(nextId)) break;
+      }
+
+      return { ids, generatedIds };
+    }
+
+    async function generateContinuation() {
       const { metadata, tokenizer, session } = await loadEverything();
       buttonEl.disabled = true;
       const maxNewTokens = Math.max(1, Math.min(300, Number(maxTokensEl.value) || 80));
@@ -325,24 +551,22 @@
       const topK = Math.max(0, Math.floor(Number(topKEl.value) || 0));
       let ids = tokenizer.encode(promptEl.value, true);
       const originalLength = ids.length;
-      const blockSize = Number(metadata.block_size) || 10000;
 
       try {
-        for (let step = 0; step < maxNewTokens; step++) {
-          const context = ids.slice(Math.max(0, ids.length - blockSize));
-          const input = new ort.Tensor("int64", BigInt64Array.from(context.map(BigInt)), [1, context.length]);
-          const outputs = await session.run({ input_ids: input });
-          const logitsTensor = outputs.logits;
-          const vocabSize = logitsTensor.dims[2];
-          const offset = (logitsTensor.dims[1] - 1) * vocabSize;
-          const nextLogits = logitsTensor.data.slice(offset, offset + vocabSize);
-          const nextId = softmaxSample(nextLogits, temperature, topK);
-          ids.push(nextId);
-          promptEl.value += tokenizer.decode([nextId]);
-          statusEl.textContent = `已生成 ${step + 1} / ${maxNewTokens} token`;
-          await new Promise((resolve) => requestAnimationFrame(resolve));
-          if (nextId === tokenizer.eosId) break;
-        }
+        await runTokenLoop({
+          ids,
+          maxNewTokens,
+          temperature,
+          topK,
+          metadata,
+          tokenizer,
+          session,
+          stopIds: new Set([tokenizer.eosId]),
+          onToken(nextId, count) {
+            promptEl.value += tokenizer.decode([nextId]);
+            statusEl.textContent = `已生成 ${count} / ${maxNewTokens} token`;
+          },
+        });
         const generated = tokenizer.decode(ids.slice(originalLength));
         if (generated && !promptEl.value.endsWith(generated)) {
           promptEl.value = tokenizer.decode(ids);
@@ -350,6 +574,56 @@
         statusEl.textContent = "续写完成。";
       } finally {
         buttonEl.disabled = false;
+      }
+    }
+
+    async function generateChat() {
+      const userText = chatInputEl.value.trim();
+      if (!userText) return;
+
+      const { metadata, tokenizer, session } = await loadEverything();
+      buttonEl.disabled = true;
+      const maxNewTokens = Math.max(1, Math.min(300, Number(maxTokensEl.value) || 80));
+      const temperature = Number(temperatureEl.value) || 0.9;
+      const topK = Math.max(0, Math.floor(Number(topKEl.value) || 0));
+      const historyTurns = Math.max(0, Math.floor(Number(historyTurnsEl.value) || 0));
+      const visibleHistory = chatHistory.slice(Math.max(0, chatHistory.length - historyTurns));
+      const ids = encodeChatPrompt(tokenizer, systemPromptEl.value, visibleHistory, userText, true);
+      const assistantMessage = { user: userText, assistant: "" };
+      chatHistory.push(assistantMessage);
+      chatInputEl.value = "";
+      renderChat();
+
+      try {
+        const result = await runTokenLoop({
+          ids,
+          maxNewTokens,
+          temperature,
+          topK,
+          metadata,
+          tokenizer,
+          session,
+          stopIds: new Set([tokenizer.eosId]),
+          onToken(_nextId, count, generatedIds) {
+            assistantMessage.assistant = decodeChatResponse(tokenizer, generatedIds);
+            renderChat();
+            statusEl.textContent = `已生成 ${count} / ${maxNewTokens} token`;
+          },
+        });
+        const answer = decodeChatResponse(tokenizer, result.generatedIds) || tokenizer.decode(result.generatedIds).trim();
+        assistantMessage.assistant = answer;
+        renderChat();
+        statusEl.textContent = "回复完成。";
+      } finally {
+        buttonEl.disabled = false;
+      }
+    }
+
+    async function generate() {
+      if (mode === "chat") {
+        await generateChat();
+      } else {
+        await generateContinuation();
       }
     }
 
@@ -361,6 +635,25 @@
       });
     });
 
+    continueModeButtonEl.addEventListener("click", () => setMode("continue"));
+    chatModeButtonEl.addEventListener("click", () => setMode("chat"));
+    clearChatButtonEl.addEventListener("click", () => {
+      chatHistory = [];
+      renderChat();
+      statusEl.textContent = "对话已清空。";
+    });
+    chatInputEl.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+        event.preventDefault();
+        generate().catch((error) => {
+          console.error(error);
+          statusEl.textContent = error.message || String(error);
+          buttonEl.disabled = false;
+        });
+      }
+    });
+
+    setMode("continue");
     loadEverything().catch((error) => {
       console.error(error);
       statusEl.textContent = error.message || String(error);
