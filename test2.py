@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -56,8 +57,7 @@ def load_tinygpt(model_path: Path, tokenizer_path: Path, device: torch.device) -
     tokenizer = BPETokenizer.load(tokenizer_path)
     checkpoint = torch.load(model_path, map_location=device)
     config = checkpoint_model_config(checkpoint)
-    if int(config["vocab_size"]) != tokenizer.vocab_size:
-        config = {**config, "vocab_size": tokenizer.vocab_size}
+    config["vocab_size"] = tokenizer.vocab_size
     model = TinyGPT(**config)
     expected = model.state_dict()
     loadable = {
@@ -92,15 +92,16 @@ def check_stage3_artifacts(
     #     assert dataset_acc >= TARGET_DATASET_ACC, f"dataset token_acc {dataset_acc:.4f} < {TARGET_DATASET_ACC}"
     #     assert dataset2_acc >= TARGET_DATASET2_ACC, f"dataset2 token_acc {dataset2_acc:.4f} < {TARGET_DATASET2_ACC}"
 
+    tokenizer = BPETokenizer.load(tokenizer_path)
     checkpoint = torch.load(model_path, map_location="cpu")
     config = checkpoint_model_config(checkpoint)
+    config["vocab_size"] = tokenizer.vocab_size
     assert int(config["block_size"]) == Stage1Config.block_size == BLOCK_SIZE
     assert BATCH_SIZE == Stage1Config.batch_size == 8
     assert int(config["n_embd"]) == Stage1Config.n_embd
     assert int(config["n_head"]) == Stage1Config.n_head
     assert int(config["n_layer"]) == Stage1Config.n_layer
 
-    tokenizer = BPETokenizer.load(tokenizer_path)
     model = TinyGPT(**config)
     model.load_state_dict(checkpoint_model_state(checkpoint, model), strict=False)
     model.eval()
@@ -151,7 +152,8 @@ def run_continuation(args: argparse.Namespace) -> None:
             torch.cuda.manual_seed_all(args.seed)
 
     tokenizer, model, _ = load_tinygpt(args.model, args.tokenizer, device)
-    ids = tokenizer.encode(args.prompt, add_bos=not args.no_bos)
+    prompt = build_assistant_prompt(args.prompt)
+    ids = tokenizer.encode(prompt, add_bos=not args.no_bos)
     if not ids:
         ids = [tokenizer.bos_id]
     idx = torch.tensor([ids], dtype=torch.long, device=device)
@@ -165,54 +167,42 @@ def run_continuation(args: argparse.Namespace) -> None:
     print(tokenizer.decode(generated[0].detach().cpu().tolist()))
 
 
-def append_role_prefix(tokenizer: BPETokenizer, ids: list[int], role_token: str) -> None:
-    ids.append(tokenizer.special_id(role_token))
-    ids.extend(tokenizer.encode(": "))
+def build_assistant_prompt(
+    user_text: str,
+    user_token: str = "<usr1>",
+    assistant_token: str = "<boiwan>",
+) -> str:
+    if re.search(r"(^|\n)<[^>\n]+>:", user_text):
+        return user_text
+    return f"{user_token}: {user_text}\n{assistant_token}:"
 
 
-def encode_chat_prompt(
-    tokenizer: BPETokenizer,
-    system_prompt: str,
+def format_chat_prompt(
     history: list[tuple[str, str]],
     user_text: str,
-    add_bos: bool,
-) -> list[int]:
-    ids = [tokenizer.bos_id] if add_bos else []
-    append_role_prefix(tokenizer, ids, "<system>")
-    ids.extend(tokenizer.encode(system_prompt.strip()))
+    user_token: str = "<usr1>",
+    assistant_token: str = "<boiwan>",
+) -> str:
+    lines: list[str] = []
     for user, assistant in history:
-        ids.extend(tokenizer.encode("\n"))
-        append_role_prefix(tokenizer, ids, "<usr>")
-        ids.extend(tokenizer.encode(user.strip()))
-        ids.extend(tokenizer.encode("\n"))
-        append_role_prefix(tokenizer, ids, "<agent>")
-        ids.append(tokenizer.bos_id)
-        ids.extend(tokenizer.encode(assistant.strip()))
-        ids.append(tokenizer.eos_id)
-    ids.extend(tokenizer.encode("\n"))
-    append_role_prefix(tokenizer, ids, "<usr>")
-    ids.extend(tokenizer.encode(user_text.strip()))
-    ids.extend(tokenizer.encode("\n"))
-    append_role_prefix(tokenizer, ids, "<agent>")
-    ids.append(tokenizer.bos_id)
-    return ids
+        lines.append(f"{user_token}: {user}")
+        lines.append(f"{assistant_token}: {assistant}")
+    lines.append(f"{user_token}: {user_text}")
+    lines.append(f"{assistant_token}:")
+    return "\n".join(lines)
 
 
-def decode_chat_response(tokenizer: BPETokenizer, generated_ids: list[int]) -> str:
-    stop_ids = {
-        tokenizer.eos_id,
-        tokenizer.special_id("<usr>"),
-        tokenizer.special_id("<agent>"),
-        tokenizer.special_id("<system>"),
-    }
-    trimmed: list[int] = []
-    for token_id in generated_ids:
-        if int(token_id) in stop_ids:
-            break
-        trimmed.append(int(token_id))
-    if trimmed and trimmed[0] == tokenizer.bos_id:
-        trimmed = trimmed[1:]
-    return tokenizer.decode(trimmed).strip()
+def trim_response(text: str) -> str:
+    end = len(text)
+    for match in re.finditer(r"\n<[^>\n]+>:", text):
+        end = min(end, match.start())
+        break
+    markers = ("\n用户：", "\n助手：", "\nUser:", "\nuser:", "\n### 用户", "\nHuman:")
+    for marker in markers:
+        pos = text.find(marker)
+        if pos >= 0:
+            end = min(end, pos)
+    return text[:end].strip()
 
 
 def run_chat(args: argparse.Namespace) -> None:
@@ -236,13 +226,8 @@ def run_chat(args: argparse.Namespace) -> None:
         if user_text.lower() in {"exit", "quit", "q"}:
             break
 
-        ids = encode_chat_prompt(
-            tokenizer,
-            args.system_prompt,
-            history[-args.history_turns :],
-            user_text,
-            add_bos=not args.no_bos,
-        )
+        prompt = format_chat_prompt(history[-args.history_turns :], user_text)
+        ids = tokenizer.encode(prompt, add_bos=not args.no_bos)
         if not ids:
             ids = [tokenizer.bos_id]
         idx = torch.tensor([ids], dtype=torch.long, device=device)
@@ -252,10 +237,9 @@ def run_chat(args: argparse.Namespace) -> None:
             max_new_tokens=args.tokens,
             temperature=args.temperature,
             top_k=args.top_k,
-            stop_token_ids={tokenizer.eos_id},
         )
         generated_ids = generated[0, len(ids) :].detach().cpu().tolist()
-        answer = decode_chat_response(tokenizer, generated_ids)
+        answer = trim_response(tokenizer.decode(generated_ids))
         if not answer:
             answer = tokenizer.decode(generated_ids).strip()
         print(f"助手：{answer}", flush=True)
@@ -278,13 +262,8 @@ def run_dialogue_sample(args: argparse.Namespace) -> None:
 
     print("<dialogue>", flush=True)
     for user_text in prompts:
-        ids = encode_chat_prompt(
-            tokenizer,
-            args.system_prompt,
-            history[-args.history_turns :],
-            user_text,
-            add_bos=not args.no_bos,
-        )
+        prompt = format_chat_prompt(history[-args.history_turns :], user_text)
+        ids = tokenizer.encode(prompt, add_bos=not args.no_bos)
         idx = torch.tensor([ids], dtype=torch.long, device=device)
         generated = continue_text(
             model,
@@ -292,12 +271,11 @@ def run_dialogue_sample(args: argparse.Namespace) -> None:
             max_new_tokens=args.tokens,
             temperature=args.temperature,
             top_k=args.top_k,
-            stop_token_ids={tokenizer.eos_id},
         )
         generated_ids = generated[0, len(ids) :].detach().cpu().tolist()
-        answer = decode_chat_response(tokenizer, generated_ids)
-        print(f"<usr>: {user_text}", flush=True)
-        print(f"<agent>: {answer}", flush=True)
+        answer = trim_response(tokenizer.decode(generated_ids))
+        print(f"<usr1>: {user_text}", flush=True)
+        print(f"<boiwan>: {answer}", flush=True)
         history.append((user_text, answer))
     print("</dialogue>", flush=True)
 

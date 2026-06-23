@@ -82,6 +82,7 @@ def main() -> None:
 
     checkpoint = torch.load(args.model, map_location="cpu")
     config = checkpoint_model_config(checkpoint)
+    config["vocab_size"] = tokenizer.vocab_size
     model = TinyGPT(**config)
     model.load_state_dict(checkpoint_model_state(checkpoint, model), strict=False)
 

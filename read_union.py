@@ -13,9 +13,9 @@ from read import (
     corpus_stats,
     ids_corpus_stats,
     load_or_train_tokenizer,
-    read_ids as read_dataset_ids,
     read_texts as read_dataset_texts,
 )
+from read_dataset_wby_sft import read_texts as read_dataset_wby_sft_texts
 from sft.emotion.download_data import parse_parlai_personachat
 from sft.emotion.read import Dataset as EmotionDataset
 from sft.emotion.read import EmotionSample
@@ -23,6 +23,7 @@ from sft.emotion.read import format_dialogue
 
 
 DEFAULT_DATASET_DIR = Path("dataset")
+DEFAULT_DATASET_WBY_SFT_DIR = Path("dataset_wby_sft")
 DEFAULT_TOKENIZER_PATH = Path("params/tokenizer2.json")
 IGNORE_INDEX = -100
 EMOTION_SFT_PERSONACHAT_TARGET = 64_670
@@ -48,15 +49,27 @@ def _clean_texts(texts: list[tuple[Path, str]]) -> list[tuple[Path, str]]:
     return cleaned
 
 
-def read_dataset_part(dataset_dir: str | Path = DEFAULT_DATASET_DIR) -> list[tuple[Path, str]]:
-    return _clean_texts(read_dataset_texts(dataset_dir))
+def read_dataset_part(
+    dataset_dir: str | Path = DEFAULT_DATASET_DIR,
+    dataset_wby_sft_dir: str | Path = DEFAULT_DATASET_WBY_SFT_DIR,
+) -> list[tuple[Path, str]]:
+    texts = _clean_texts(read_dataset_texts(dataset_dir))
+    if Path(dataset_wby_sft_dir).exists():
+        texts.extend(_clean_texts(read_dataset_wby_sft_texts(dataset_wby_sft_dir)))
+    return texts
 
 
 def read_dataset_part_ids(
     tokenizer: BPETokenizer,
     dataset_dir: str | Path = DEFAULT_DATASET_DIR,
+    dataset_wby_sft_dir: str | Path = DEFAULT_DATASET_WBY_SFT_DIR,
 ) -> list[tuple[Path, list[int]]]:
-    return read_dataset_ids(tokenizer, dataset_dir)
+    samples: list[tuple[Path, list[int]]] = []
+    for path, text in read_dataset_part(dataset_dir, dataset_wby_sft_dir):
+        ids = tokenizer.encode(text, add_bos=True, add_eos=True)
+        if ids:
+            samples.append((path, ids))
+    return samples
 
 
 def load_dataset2(
@@ -283,11 +296,12 @@ def read_dataset2_part(
 def read_union_texts(
     dataset_dir: str | Path = DEFAULT_DATASET_DIR,
     dataset2_dir: str | Path | None = None,
+    dataset_wby_sft_dir: str | Path = DEFAULT_DATASET_WBY_SFT_DIR,
     tokenizer_path: str | Path = DEFAULT_TOKENIZER_PATH,
     context_length: int = DEFAULT_CONTEXT_LENGTH,
     max_dataset2_samples: int | None = None,
 ) -> list[tuple[Path, str]]:
-    texts = read_dataset_part(dataset_dir)
+    texts = read_dataset_part(dataset_dir, dataset_wby_sft_dir)
     texts.extend(read_dataset_emotion_sft_part())
     texts.extend(
         read_dataset2_part(
@@ -303,8 +317,9 @@ def read_union_texts(
 def iter_dataset1_token_samples(
     tokenizer: BPETokenizer,
     dataset_dir: str | Path = DEFAULT_DATASET_DIR,
+    dataset_wby_sft_dir: str | Path = DEFAULT_DATASET_WBY_SFT_DIR,
 ) -> Iterator[TokenSample]:
-    for path, text in read_dataset_part(dataset_dir):
+    for path, text in read_dataset_part(dataset_dir, dataset_wby_sft_dir):
         tokens = tokenizer.encode(text, add_bos=True, add_eos=True)
         if tokens:
             yield TokenSample("dataset", path, tokens)
@@ -322,10 +337,11 @@ def iter_dataset2_token_samples(
 def iter_union_token_samples(
     tokenizer: BPETokenizer,
     dataset_dir: str | Path = DEFAULT_DATASET_DIR,
+    dataset_wby_sft_dir: str | Path = DEFAULT_DATASET_WBY_SFT_DIR,
     context_length: int = DEFAULT_CONTEXT_LENGTH,
     preprocess_dir: str | Path | None = None,
 ) -> Iterator[TokenSample]:
-    yield from iter_dataset1_token_samples(tokenizer, dataset_dir)
+    yield from iter_dataset1_token_samples(tokenizer, dataset_dir, dataset_wby_sft_dir)
     yield from iter_dataset_emotion_sft_token_samples(tokenizer)
     yield from iter_dataset2_token_samples(context_length=context_length, preprocess_dir=preprocess_dir)
 
@@ -349,6 +365,7 @@ def iter_selected_token_samples(
 def iter_union_ids(
     tokenizer_or_path: BPETokenizer | str | Path = DEFAULT_TOKENIZER_PATH,
     dataset_dir: str | Path = DEFAULT_DATASET_DIR,
+    dataset_wby_sft_dir: str | Path = DEFAULT_DATASET_WBY_SFT_DIR,
     context_length: int = DEFAULT_CONTEXT_LENGTH,
     preprocess_dir: str | Path | None = None,
 ) -> Iterator[tuple[Path, list[int]]]:
@@ -360,6 +377,7 @@ def iter_union_ids(
     for sample in iter_union_token_samples(
         tokenizer,
         dataset_dir=dataset_dir,
+        dataset_wby_sft_dir=dataset_wby_sft_dir,
         context_length=context_length,
         preprocess_dir=preprocess_dir,
     ):
@@ -369,6 +387,7 @@ def iter_union_ids(
 def read_union_ids(
     tokenizer_or_path: BPETokenizer | str | Path = DEFAULT_TOKENIZER_PATH,
     dataset_dir: str | Path = DEFAULT_DATASET_DIR,
+    dataset_wby_sft_dir: str | Path = DEFAULT_DATASET_WBY_SFT_DIR,
     context_length: int = DEFAULT_CONTEXT_LENGTH,
     preprocess_dir: str | Path | None = None,
     max_samples: int | None = None,
@@ -380,6 +399,7 @@ def read_union_ids(
         iter_union_ids(
             tokenizer_or_path,
             dataset_dir=dataset_dir,
+            dataset_wby_sft_dir=dataset_wby_sft_dir,
             context_length=context_length,
             preprocess_dir=preprocess_dir,
         )
@@ -396,12 +416,18 @@ def _dataset2_token_count(dataset: Dataset2) -> int:
 
 def verify_union(
     dataset_dir: str | Path = DEFAULT_DATASET_DIR,
+    dataset_wby_sft_dir: str | Path = DEFAULT_DATASET_WBY_SFT_DIR,
     context_length: int = DEFAULT_CONTEXT_LENGTH,
     preprocess_dir: str | Path | None = None,
     datasets: set[str] | None = None,
 ) -> dict[str, object]:
     selected = set(DATASET_CHOICES) if datasets is None else datasets
-    dataset_texts = read_dataset_part(dataset_dir) if "dataset" in selected else []
+    dataset_wby_sft_texts = (
+        _clean_texts(read_dataset_wby_sft_texts(dataset_wby_sft_dir))
+        if "dataset" in selected and Path(dataset_wby_sft_dir).exists()
+        else []
+    )
+    dataset_texts = read_dataset_part(dataset_dir, dataset_wby_sft_dir) if "dataset" in selected else []
     emotion_sft = load_dataset_emotion_sft_samples() if "dataset_emotion_sft" in selected else []
     emotion_sft_source_counts: dict[str, int] = {}
     for sample in emotion_sft:
@@ -432,6 +458,7 @@ def verify_union(
         "ok": dataset2_ok,
         "selected_datasets": sorted(selected),
         "dataset_samples": len(dataset_texts),
+        "dataset_wby_sft_samples": len(dataset_wby_sft_texts),
         "dataset_emotion_sft_samples": len(emotion_sft),
         "dataset_emotion_sft_source_counts": emotion_sft_source_counts,
         "dataset2_samples": dataset2_samples,

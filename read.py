@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 from tokenizers import Tokenizer
@@ -10,7 +11,34 @@ from tokenizers.pre_tokenizers import ByteLevel
 from tokenizers.trainers import BpeTrainer
 
 
-SPECIAL_TOKENS = ["<pad>", "<unk>", "<bos>", "<eos>", "<agent>", "<usr>", "<system>"]
+BASE_SPECIAL_TOKENS = ["<pad>", "<unk>", "<bos>", "<eos>", "<agent>", "<usr>", "<system>"]
+DEFAULT_SFT_DIR = Path("dataset_wby_sft")
+SPEAKER_PATTERN = re.compile(r"`([^`]+)`\s*:")
+
+
+def _normalize_speaker_name(name: str) -> str:
+    return name.strip()
+
+
+def _speaker_token(name: str) -> str:
+    return f"<{_normalize_speaker_name(name)}>"
+
+
+def collect_speaker_special_tokens(dataset_dir: str | Path = DEFAULT_SFT_DIR) -> list[str]:
+    root = Path(dataset_dir)
+    if not root.exists():
+        return []
+    tokens: set[str] = set()
+    for path in sorted(root.glob("*.md")):
+        if not path.is_file() or path.name.startswith("._") or path.name == "data.md":
+            continue
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        for speaker in SPEAKER_PATTERN.findall(text):
+            tokens.add(_speaker_token(speaker))
+    return sorted(tokens)
+
+
+SPECIAL_TOKENS = BASE_SPECIAL_TOKENS + collect_speaker_special_tokens()
 
 
 def find_text_files(dataset_dir: str | Path = "dataset") -> list[Path]:
@@ -49,7 +77,10 @@ class BPETokenizer:
     def __init__(self, tokenizer: Tokenizer, target_vocab_size: int = 16000) -> None:
         self.tokenizer = tokenizer
         self.target_vocab_size = target_vocab_size
-        vocab = tokenizer.get_vocab()
+        self._refresh_special_token_ids()
+
+    def _refresh_special_token_ids(self) -> None:
+        vocab = self.tokenizer.get_vocab()
         self.pad_id = vocab["<pad>"]
         self.unk_id = vocab["<unk>"]
         self.bos_id = vocab["<bos>"]
@@ -105,7 +136,15 @@ class BPETokenizer:
                 self.system_id,
             }
         ]
-        return self.tokenizer.decode(filtered, skip_special_tokens=True)
+        return self.tokenizer.decode(filtered, skip_special_tokens=False)
+
+    def ensure_special_tokens(self, tokens: list[str]) -> bool:
+        missing = [token for token in tokens if token not in self.tokenizer.get_vocab()]
+        if not missing:
+            return False
+        self.tokenizer.add_special_tokens(missing)
+        self._refresh_special_token_ids()
+        return True
 
     def save(self, path: str | Path) -> None:
         path = Path(path)
@@ -123,7 +162,10 @@ class BPETokenizer:
         if meta_path(path).exists():
             payload = json.loads(meta_path(path).read_text(encoding="utf-8"))
             target_vocab_size = int(payload.get("target_vocab_size", target_vocab_size))
-        return cls(Tokenizer.from_file(str(path)), target_vocab_size=target_vocab_size)
+        wrapped = cls(Tokenizer.from_file(str(path)), target_vocab_size=target_vocab_size)
+        if wrapped.ensure_special_tokens(SPECIAL_TOKENS):
+            wrapped.save(path)
+        return wrapped
 
 
 def meta_path(path: Path) -> Path:

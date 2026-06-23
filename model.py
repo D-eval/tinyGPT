@@ -17,7 +17,25 @@ def checkpoint_model_config(checkpoint: dict) -> dict:
 
 def checkpoint_model_state(checkpoint: dict, model: "TinyGPT") -> dict:
     expected = model.state_dict()
-    return {key: value for key, value in checkpoint["model_state"].items() if key in expected}
+    loaded: dict[str, torch.Tensor] = {}
+    for key, value in checkpoint["model_state"].items():
+        if key not in expected:
+            continue
+        target = expected[key]
+        if value.shape == target.shape:
+            loaded[key] = value
+            continue
+        if (
+            key in {"token_emb.weight", "head.weight"}
+            and value.ndim == 2
+            and target.ndim == 2
+            and value.shape[1] == target.shape[1]
+        ):
+            resized = target.clone()
+            keep = min(value.shape[0], target.shape[0])
+            resized[:keep] = value[:keep]
+            loaded[key] = resized
+    return loaded
 
 
 class CausalSelfAttention(nn.Module):

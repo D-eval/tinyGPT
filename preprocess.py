@@ -15,10 +15,12 @@ from tokenizers.trainers import BpeTrainer
 
 from dataset2.read import Dataset as Dataset2
 from read import BPETokenizer, SPECIAL_TOKENS, read_texts as read_dataset1_texts
+from read_dataset_wby_sft import read_texts as read_dataset_wby_sft_texts
 
 
 TOKENIZER_PATH = Path("params/tokenizer2.json")
 DEFAULT_OUT_DIR = Path("preprocess")
+DEFAULT_DATASET_WBY_SFT_DIR = Path("dataset_wby_sft")
 VOCAB_SIZE = 16_000
 VALID_RATIO = 0.01
 TOKEN_DTYPE = "uint32"
@@ -29,6 +31,10 @@ PREVIEW_TOKENS = 40
 
 def dataset1_iter(dataset_dir: str | Path) -> Iterator[tuple[Path, str]]:
     for path, text in read_dataset1_texts(dataset_dir):
+        text = text.strip()
+        if text:
+            yield path, text
+    for path, text in read_dataset_wby_sft_texts(DEFAULT_DATASET_WBY_SFT_DIR):
         text = text.strip()
         if text:
             yield path, text
